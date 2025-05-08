@@ -4,9 +4,31 @@ import getpass
 import time
 import subprocess
 import sys
+import requests
+import io
+import re
+import pyperclip
+from selenium.webdriver.common.keys import Keys
+from typing import List, Dict, Any, Optional
 
 # Archivo para guardar las credenciales de acceso
-CREDENTIALS_FILE = "fb_credentials.json"    
+CREDENTIALS_FILE = "fb_credentials.json"
+
+# Configuración para la API de Gemini
+GEMINI_API_KEY = 'AIzaSyDRivvwFML1GTZ_S-h5Qfx4qP3EKforMoM'
+GEMINI_API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
+
+# Ruta al catálogo PDF
+CATALOG_PATH = './catalogo_.pdf'
+
+# Variable global para rastrear si estamos esperando una consulta
+waiting_for_query = {}
+
+# Comandos para activar el bot
+START_COMMANDS = ['!start', 'hola', 'consulta', 'inicio', 'comenzar', 'ayuda', 'start', 'hi', 'hello']
+
+# Comandos para salir
+EXIT_COMMANDS = ['salir', 'exit', 'menu', 'volver', 'regresar', 'terminar', 'finalizar', '!menu', '!start']
 
 def get_credentials():
     """Solicita las credenciales al usuario y las guarda en un archivo"""
@@ -35,7 +57,9 @@ def install_dependencies():
     dependencies = [
         "selenium", 
         "undetected-chromedriver",
-        "webdriver-manager"
+        "webdriver-manager",
+        "requests",
+        "PyPDF2"
     ]
     
     print("Instalando dependencias necesarias...")
@@ -48,6 +72,196 @@ def install_dependencies():
             subprocess.check_call([sys.executable, "-m", "pip", "install", dep])
     
     print("Todas las dependencias están instaladas.")
+
+def get_chat_data():
+    """
+    Obtiene datos del chat desde una API local o archivo de configuración.
+    Si no está disponible, devuelve datos predeterminados.
+    """
+    try:
+        # Intentar obtener datos desde una API local
+        response = requests.get('http://localhost:5001/api/chat', timeout=5)
+        if response.status_code == 200:
+            return response.json()
+    except:
+        pass
+    
+    # Si no se puede conectar a la API, usar datos predeterminados
+    return {
+        "bienvenida": "✨ ¡Bienvenido al Asistente de Ventas! ✨\n🛍️ Estoy aquí para ayudarte a…",
+        "menu": [
+            "1️⃣ Consultar productos",
+            "2️⃣ Ofertas especiales",
+            "3️⃣ Información de envíos",
+            "4️⃣ Otros (realizar pregunta personalizada)",
+            "5️⃣ Salir"
+        ],
+        "respuestas": {
+            "1": "📦 *Catálogo de Productos*\n\nNuestros productos están organizados en las siguientes categorías:\n- Electrónica\n- Ropa y accesorios\n- Hogar y jardín\n- Belleza y cuidado personal\n\n¿Sobre qué categoría te gustaría más información?",
+            "2": "🏷️ *Ofertas Especiales*\n\n¡Tenemos increíbles descuentos esta semana!\n- 30% OFF en todos los productos de electrónica\n- 2x1 en ropa de temporada\n- Envío gratis en compras mayores a $50\n\nEstas ofertas son válidas hasta el final de mes.",
+            "3": "🚚 *Información de Envíos*\n\nNuestras políticas de envío:\n- Envío estándar (3-5 días): $5.99\n- Envío express (1-2 días): $12.99\n- Envío gratuito en compras superiores a $50\n\nHacemos envíos a todo el país.",
+            "4": "📚 *Consulta al catálogo*\n\nAhora puedes hacer preguntas sobre nuestro catálogo de productos. ¿Qué te gustaría saber?"
+        }
+    }
+
+def extract_text_from_pdf(pdf_path):
+    """Extrae el texto de un archivo PDF"""
+    try:
+        import PyPDF2
+        
+        if not os.path.exists(pdf_path):
+            print(f"❌ Archivo PDF no encontrado: {pdf_path}")
+            return None
+        
+        text = ""
+        with open(pdf_path, 'rb') as file:
+            reader = PyPDF2.PdfReader(file)
+            for page_num in range(len(reader.pages)):
+                page = reader.pages[page_num]
+                text += page.extract_text() + "\n"
+        
+        return text
+    except Exception as e:
+        print(f"❌ Error al extraer texto del PDF: {e}")
+        return None
+
+def split_text_into_chunks(text, chunk_size=250, chunk_overlap=80):
+    """Divide el texto en fragmentos más pequeños con solapamiento"""
+    if not text:
+        return []
+        
+    chunks = []
+    sentences = text.split('\n')
+    sentences = [s for s in sentences if s.strip()]
+    
+    current_chunk = ""
+    
+    for sentence in sentences:
+        if len(current_chunk) + len(sentence) > chunk_size:
+            if current_chunk:
+                chunks.append(current_chunk)
+            
+            if current_chunk and chunk_overlap > 0:
+                words = current_chunk.split()
+                overlap_words = words[-int(chunk_overlap / 5):]
+                current_chunk = ' '.join(overlap_words) + ' ' + sentence
+            else:
+                current_chunk = sentence
+        else:
+            current_chunk = current_chunk + "\n" + sentence if current_chunk else sentence
+    
+    if current_chunk:
+        chunks.append(current_chunk)
+    
+    return chunks
+
+def find_relevant_chunks(chunks, query, max_chunks=5):
+    """Encuentra los fragmentos más relevantes para la consulta"""
+    if not chunks:
+        return []
+        
+    lower_query = query.lower()
+    query_terms = [term for term in lower_query.split() if len(term) > 3]
+    
+    scored_chunks = []
+    for chunk in chunks:
+        lower_chunk = chunk.lower()
+        score = 0
+        
+        for term in query_terms:
+            if term in lower_chunk:
+                score += 1
+        
+        scored_chunks.append({"chunk": chunk, "score": score})
+    
+    # Ordenar por puntuación y tomar los mejores
+    scored_chunks.sort(key=lambda x: x["score"], reverse=True)
+    return [item["chunk"] for item in scored_chunks[:max_chunks]]
+
+def process_query_with_gemini(query, pdf_path=CATALOG_PATH):
+    """Procesa una consulta usando Gemini AI y el catálogo PDF"""
+    try:
+        # Extraer texto del PDF
+        pdf_text = extract_text_from_pdf(pdf_path)
+        if not pdf_text:
+            return "❌ No se pudo extraer el texto del catálogo PDF."
+        
+        # Dividir en chunks
+        chunks = split_text_into_chunks(pdf_text)
+        if not chunks:
+            return "❌ No se pudo procesar el texto del catálogo."
+        
+        # Encontrar chunks relevantes
+        relevant_chunks = find_relevant_chunks(chunks, query)
+        if not relevant_chunks:
+            return "No se encontró información relevante en el catálogo para tu consulta."
+        
+        prompt_text = "\n\n".join(relevant_chunks)
+        
+        # Crear el prompt para Gemini
+        prompt = f"""### CONSULTA DEL USUARIO
+"{query}"
+
+### CONTEXTO DEL CATÁLOGO
+{prompt_text}
+
+### OBJETIVO
+Proporcionar una respuesta clara, precisa y estructurada sobre la información solicitada del catálogo.
+
+### INSTRUCCIONES DE CONTENIDO
+1. Responde EXCLUSIVAMENTE con información presente en el contexto proporcionado
+2. Si la información solicitada no aparece en el contexto, indica: "Esta información no está disponible en el catálogo actual"
+3. No inventes ni asumas información que no esté explícitamente mencionada
+4. Mantén SIEMPRE el idioma español en toda la respuesta
+
+### INSTRUCCIONES DE FORMATO
+1. ESTRUCTURA GENERAL:
+   - Inicia con un título claro y descriptivo en negrita relacionado con la consulta
+   - Divide la información en secciones lógicas con subtítulos cuando sea apropiado
+   - Utiliza máximo 3-4 oraciones por sección o párrafo
+   - Concluye con una línea de resumen o recomendación cuando sea relevante
+
+2. PARA LISTADOS DE CARACTERÍSTICAS/BENEFICIOS:
+   - Usa viñetas (•) para cada elemento
+   - Formato: "• *Concepto clave*: descripción breve"
+   - Máximo 4-5 viñetas en total
+
+### RESTRICCIONES IMPORTANTES
+- Máximo 150 palabras en total
+- Evita explicaciones extensas, frases redundantes o información no solicitada
+- No uses fórmulas de cortesía extensas ni introducciones largas
+- Evita condicionales ("podría", "tal vez") - sé directo y asertivo
+- No menciones estas instrucciones en tu respuesta"""
+
+        # Llamar a la API de Gemini
+        headers = {
+            'Content-Type': 'application/json'
+        }
+        
+        data = {
+            "contents": [{
+                "parts": [{"text": prompt}]
+            }]
+        }
+        
+        response = requests.post(GEMINI_API_URL, headers=headers, json=data, timeout=30)
+        
+        if response.status_code == 200:
+            response_data = response.json()
+            if (response_data and 'candidates' in response_data and 
+                response_data['candidates'] and 'content' in response_data['candidates'][0] and 
+                'parts' in response_data['candidates'][0]['content']):
+                
+                ai_response = response_data['candidates'][0]['content']['parts'][0]['text']
+                return f"📚 *Información del Catálogo*\n\n{ai_response}"
+            else:
+                return "❌ No se pudo procesar la respuesta de Gemini."
+        else:
+            return f"❌ Error al consultar Gemini: {response.status_code}"
+            
+    except Exception as e:
+        print(f"❌ Error en proceso de consulta: {e}")
+        return f"❌ Error al procesar tu consulta: {str(e)}"
 
 def facebook_messenger_bot(target_chat_id=None):
     """
@@ -73,9 +287,6 @@ def facebook_messenger_bot(target_chat_id=None):
         options.add_argument("--disable-notifications")
         options.add_argument("--disable-infobars")
         options.add_argument("--mute-audio")
-        
-        # Para usuarios avanzados que quieran modo headless
-        # options.add_argument("--headless")
         
         print("Iniciando navegador Chrome...")
         
@@ -188,8 +399,141 @@ def facebook_messenger_bot(target_chat_id=None):
                 print("El bot revisará las conversaciones no leídas y responderá automáticamente.")
             print("Para detener el bot, cierra el navegador o presiona Ctrl+C en esta terminal.")
             
+            # Función para enviar un mensaje
+            def send_message_clipboard(driver, message_text):
+                try:
+                    # Usar el portapapeles para transferir el texto (evita problemas de caracteres)
+                    pyperclip.copy(message_text)
+                    
+                    # Encuentra el campo de entrada como antes
+                    selectors = [
+                        "//div[@role='textbox' and (@aria-label='Mensaje' or @aria-label='Message')]",
+                        "//div[@contenteditable='true'][@role='textbox']",
+                        "//div[@data-lexical-editor='true']"
+                    ]
+                    
+                    message_input = None
+                    for selector in selectors:
+                        try:
+                            message_input = driver.find_element(By.XPATH, selector)
+                            break
+                        except NoSuchElementException:
+                            continue
+                    
+                    if message_input:
+                        # Hacer clic en el campo de entrada
+                        message_input.click()
+                        time.sleep(0.5)
+                        
+                        # Usar la combinación de teclas Ctrl+V para pegar
+                        # En Windows/Linux:
+                        message_input.send_keys(Keys.CONTROL, 'v')
+                        # O si usas Mac:
+                        # message_input.send_keys(Keys.COMMAND, 'v')
+                        
+                        time.sleep(0.5)
+                        message_input.send_keys(Keys.RETURN)
+                        
+                        print(f"Mensaje enviado: {message_text}")
+                        return True
+                    else:
+                        print("No se pudo encontrar el campo de texto para enviar el mensaje")
+                        return False
+                except Exception as e:
+                    print(f"Error al enviar mensaje: {e}")
+                    return False
+            
+            # Función para enviar el menú de bienvenida
+            def send_welcome_menu(driver):
+                chat_data = get_chat_data()
+                if not chat_data:
+                    print("⚠️ No se pudo obtener el menú.")
+                    send_message_clipboard(driver, "⚠️ No se pudo obtener el menú.")
+                    return False
+                
+                menu_text = f"{chat_data['bienvenida']}\n\n"
+                menu_text += "\n".join([op for op in chat_data['menu'] if '5. Salir' not in op])
+                menu_text += "\n\n💬 *Responde con el número de la opción deseada.*"
+                
+                return send_message_clipboard(driver, menu_text)
+            
+            # Función para limpiar mensajes y extraer sólo números
+            def extract_option_number(message_text):
+                # Intentamos encontrar un número aislado en el mensaje
+                match = re.search(r'\b[1-5]\b', message_text)
+                if match:
+                    return match.group(0)
+                
+                # Si no hay un número aislado, buscamos si el mensaje contiene solo un número
+                if message_text.strip() in ["1", "2", "3", "4", "5"]:
+                    return message_text.strip()
+                
+                return message_text
+            
+            # Función para procesar las opciones del menú
+            def handle_menu_options(driver, message_text, user_id):
+                chat_data = get_chat_data()
+                if not chat_data:
+                    print("⚠️ No se pudo obtener las opciones del menú.")
+                    send_message_clipboard(driver, "⚠️ No se pudo obtener las opciones del menú.")
+                    return False
+                
+                # Si estamos esperando una consulta para este usuario
+                global waiting_for_query
+                if user_id in waiting_for_query and waiting_for_query[user_id]:
+                    print(f"💬 Recibida consulta de {user_id}: {message_text}")
+                    
+                    # Si el usuario quiere salir del modo consulta
+                    if message_text.lower() in EXIT_COMMANDS:
+                        waiting_for_query[user_id] = False
+                        send_message_clipboard(driver, "✅ Has salido del modo consulta. Volviendo al menú principal...")
+                        return send_welcome_menu(driver)
+                    
+                    # Procesar la consulta al catálogo
+                    send_message_clipboard(driver, "🔍 Consultando al catálogo con Gemini AI. Esto puede tomar un momento...")
+                    response = process_query_with_gemini(message_text)
+                    return send_message_clipboard(driver, response + "\n\n_Para salir de este modo escribe *salir* o *menu*_")
+                
+                # Ignorar silenciosamente 'menu' y 'salir'
+                if message_text.lower() in ['menu', 'salir']:
+                    print(f"🔇 Ignorando silenciosamente la palabra clave: {message_text.lower()}")
+                    return False
+                
+                # Extraer el número de opción limpio
+                clean_option = extract_option_number(message_text)
+                print(f"Opción extraída: '{clean_option}'")
+                
+                if clean_option == '4':
+                    # Opción 4: Consulta con Gemini usando el catálogo PDF
+                    # Marcar que estamos esperando una consulta de este usuario
+                    waiting_for_query[user_id] = True
+                    
+                    # Después de 2 minutos, liberamos el estado
+                    def reset_waiting_state(user_id):
+                        time.sleep(120)  # 2 minutos
+                        if user_id in waiting_for_query:
+                            waiting_for_query[user_id] = False
+                    
+                    # Iniciar un hilo para resetear el estado después de un tiempo
+                    import threading
+                    threading.Thread(target=reset_waiting_state, args=(user_id,), daemon=True).start()
+                    
+                    send_message_clipboard(driver, "🔍 *Modo Consulta al Catálogo*\n\nAhora puedes hacer preguntas sobre el catálogo.\nEscribe cualquier pregunta y Gemini AI te responderá.\nPara volver al menú principal, escribe *salir* o *menu*.")
+                    return True
+                elif clean_option in chat_data['respuestas']:
+                    print(f"✅ Respondiendo a la opción {clean_option}: {chat_data['respuestas'][clean_option]}")
+                    return send_message_clipboard(driver, chat_data['respuestas'][clean_option])
+                else:
+                    print(f'⚠️ Opción inválida: "{clean_option}". Mostrando menú nuevamente...')
+                    send_message_clipboard(driver, "⚠️ Opción no válida. Por favor, selecciona una de las opciones del menú.")
+                    return send_welcome_menu(driver)
+            
+            # Variable para evitar responder múltiples veces al mismo mensaje
+            last_processed_message = ""
+            
             # Función para responder a un mensaje
             def respond_to_message(driver):
+                nonlocal last_processed_message
                 try:
                     # Obtener los últimos mensajes
                     last_messages = driver.find_elements(By.XPATH, "//div[@role='row']")
@@ -197,60 +541,47 @@ def facebook_messenger_bot(target_chat_id=None):
                     if last_messages:
                         # Obtener el último mensaje
                         last_message = last_messages[-1]
-                        message_text = last_message.text.lower()
+                        message_text = last_message.text.strip()
                         
-                        # Verificar si el mensaje ya fue respondido (buscar nuestras respuestas anteriores)
-                        # Este es un mecanismo simple para evitar responder al mismo mensaje múltiples veces
-                        if "¡hola! ¿cómo estás?" in message_text.lower() or "¡muy bien, gracias por preguntar!" in message_text.lower():
-                            print("Este mensaje parece ser una respuesta anterior del bot. Omitiendo.")
+                        # Si este mensaje ya fue procesado, ignorarlo
+                        if message_text == last_processed_message:
+                            print("Este mensaje ya fue procesado. Ignorando.")
                             return False
+                        
+                        # Actualizar el último mensaje procesado
+                        last_processed_message = message_text
+                        
+                        # Ignorar mensajes vacíos o que parecen ser solo interfaces de carga
+                        if not message_text or message_text.lower() == "cargando...":
+                            print("Mensaje ignorado: vacío o mensaje de sistema")
+                            return False
+                        
+                        # Verificar si el mensaje parece ser una respuesta anterior del bot
+                        bot_identifiers = [
+                            "✨ ¡bienvenido", "opción no válida", "información del catálogo",
+                            "📦 *catálogo", "🏷️ *ofertas", "🚚 *información", "🔍 *modo consulta"
+                        ]
+                        
+                        for identifier in bot_identifiers:
+                            if identifier in message_text.lower():
+                                print("Este mensaje parece ser una respuesta anterior del bot. Omitiendo.")
+                                return False
                         
                         print(f"Mensaje detectado: {message_text}")
                         
-                        # Preparar respuesta según el contenido
-                        if "hola" in message_text or "hi" in message_text or "hey" in message_text:
-                            reply = "¡Hola! ¿Cómo estás?"
-                        elif "cómo estás" in message_text or "how are you" in message_text or "como estas" in message_text:
-                            reply = "¡Muy bien, gracias por preguntar!"
-                        elif "ayuda" in message_text or "help" in message_text:
-                            reply = "Estoy aquí para ayudarte. ¿En qué puedo asistirte?"
-                        elif "gracias" in message_text or "thanks" in message_text:
-                            reply = "¡De nada! Estoy para servirte."
-                        else:
-                            reply = "He recibido tu mensaje. ¿En qué puedo ayudarte?"
+                        # Generar un ID de usuario único basado en la conversación actual
+                        # (En una implementación ideal, esto sería un ID real del usuario)
+                        user_id = f"user_{hash(driver.current_url) % 10000}" 
                         
-                        # Buscar y usar el campo de texto
-                        try:
-                            # Intentar diferentes selectores para el campo de texto de entrada
-                            selectors = [
-                                "//div[@role='textbox' and (@aria-label='Mensaje' or @aria-label='Message')]",
-                                "//div[@contenteditable='true'][@role='textbox']",
-                                "//div[@data-lexical-editor='true']"
-                            ]
-                            
-                            message_input = None
-                            for selector in selectors:
-                                try:
-                                    message_input = driver.find_element(By.XPATH, selector)
-                                    break
-                                except NoSuchElementException:
-                                    continue
-                            
-                            if message_input:
-                                message_input.click()
-                                time.sleep(0.5)
-                                message_input.send_keys(reply)
-                                time.sleep(0.5)
-                                message_input.send_keys(Keys.RETURN)
-                                
-                                print(f"Respondido: {reply}")
-                                return True
-                            else:
-                                print("No se pudo encontrar el campo de texto para responder")
-                                return False
-                        except Exception as e:
-                            print(f"Error al enviar respuesta: {e}")
-                            return False
+                        # Verificar si es un comando de inicio
+                        if any(cmd in message_text.lower() for cmd in START_COMMANDS):
+                            print(f"🚀 Comando de activación detectado: {message_text}")
+                            if user_id in waiting_for_query:
+                                waiting_for_query[user_id] = False
+                            return send_welcome_menu(driver)
+                        
+                        # Procesar las opciones del menú
+                        return handle_menu_options(driver, message_text, user_id)
                     else:
                         print("No se encontraron mensajes en la conversación")
                         return False
